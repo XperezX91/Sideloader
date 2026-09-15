@@ -1,0 +1,50 @@
+name: build-win-cli
+# Baut die Sideloader-CLI (x86_64-windows-msvc) aus diesem Branch, inklusive
+# des 503-Absturz-Fixes. Exakt der offizielle Windows-Bauweg aus build-cli.yml.
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/plist-503-crash]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Commit anzeigen
+        run: git log -1 --format='%H %s'
+
+      - name: Update APT repos
+        run: sudo apt-get update
+
+      - name: Set-up D compiler
+        uses: ./.github/actions/setup-d-compiler
+        with:
+          target-triple: x86_64-windows-msvc
+
+      - name: Write version file
+        uses: ./.github/actions/write-version-file
+
+      - name: Build
+        run: dub build -b release-debug --compiler=ldc2 --arch x86_64-windows-msvc :cli-frontend
+
+      - name: Move files around for artifcation
+        uses: ./.github/actions/rename-files
+        with:
+          build-tag: cli-x86_64-windows-msvc
+
+      - name: Pruefsummen
+        run: |
+          ls -la bin/
+          sha256sum bin/* | tee bin/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sideloader-cli-x86_64-windows-msvc-fix503
+          path: ${{ github.workspace }}/bin/*
+          retention-days: 7
