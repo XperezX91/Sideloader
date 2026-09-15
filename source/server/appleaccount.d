@@ -10,6 +10,10 @@ import std.sumtype;
 import std.typecons;
 import std.uni;
 import std.zlib;
+import std.algorithm.searching : startsWith;
+import std.string : stripLeft;
+import core.thread : Thread;
+import core.time : dur;
 
 import botan.block.aes;
 import botan.block.aes_ni;
@@ -223,7 +227,7 @@ package class AppleAccount {
 
         // Fetch URLs from Apple servers
         log.debug_("Fetching URL bag...");
-        auto urlsPlist = Plist.fromXml(request.get("https://gsa.apple.com/grandslam/GsService2/lookup").responseBody().data!string())["urls"]
+        auto urlsPlist = Plist.fromXml(robustPlistHttp(() => request.get("https://gsa.apple.com/grandslam/GsService2/lookup"), "URL bag lookup"))["urls"]
             .dict().native();
         log.debug_("URL bag OK.");
 
@@ -256,7 +260,7 @@ package class AppleAccount {
         log.trace(request1Str);
 
         log.debug_("Sending first auth request...");
-        auto response1Str = request.post(urls["gsService"], request1Str).responseBody().data!string();
+        auto response1Str = robustPlistHttp(() => request.post(urls["gsService"], request1Str), "First authentication request");
         log.trace(response1Str);
         auto response1 = Plist.fromXml(response1Str)["Response"];
         log.debug_("First auth request OK.");
@@ -291,7 +295,7 @@ package class AppleAccount {
         log.trace(request2Str);
 
         log.debug_("Sending the second request...");
-        auto response2Str = request.post(urls["gsService"], request2Str).responseBody().data!string();
+        auto response2Str = robustPlistHttp(() => request.post(urls["gsService"], request2Str), "Second authentication request");
         log.trace(response2Str);
         log.debug_("Second request OK.");
 
@@ -377,7 +381,7 @@ package class AppleAccount {
             string request3Str = request3.toXml();
             log.trace(request3Str);
 
-            auto response3Str = request.post(urls["gsService"], request3Str).responseBody().data!string();
+            auto response3Str = robustPlistHttp(() => request.post(urls["gsService"], request3Str), "Token request");
             log.trace(response3Str);
 
             auto response3 = Plist.fromXml(response3Str)["Response"].dict();
@@ -509,6 +513,37 @@ package class AppleAccount {
 }
 
 private:
+// Apple's GrandSlam gsService endpoint occasionally answers with an HTTP 5xx
+// HTML error page (observed: "503 Service Temporarily Unavailable") instead of
+// a property list. The previous code piped that body straight into
+// Plist.fromXml(...)["Response"], which dereferenced a null/invalid node and
+// crashed the whole process with an access violation (0xC0000005) right after
+// "Logging in...". We now validate the HTTP status and body before parsing,
+// retry transient server errors with exponential backoff, and otherwise raise a
+// clear, catchable error so the CLI reports it cleanly instead of crashing.
+string robustPlistHttp(scope Response delegate() call, string what) {
+    auto log = getLogger();
+    enum maxAttempts = 5;
+    int code = 0;
+    string body;
+    foreach (attempt; 0 .. maxAttempts) {
+        auto res = call();
+        code = res.code;
+        body = res.responseBody().data!string();
+        auto trimmed = body.stripLeft();
+        if (code == 200 && (trimmed.startsWith("<?xml") || trimmed.startsWith("<plist") || trimmed.startsWith("bplist"))) {
+            return body;
+        }
+        log.warnF!"%s: Apple answered HTTP %d with a non-plist body (attempt %d/%d)."(what, code, attempt + 1, maxAttempts);
+        if (attempt + 1 < maxAttempts) {
+            auto waitSeconds = 1 << attempt; // 1s, 2s, 4s, 8s
+            log.infoF!"Apple server is temporarily unavailable / rate-limiting. Waiting %d s before retry..."(waitSeconds);
+            Thread.sleep(dur!"seconds"(waitSeconds));
+        }
+    }
+    throw new Exception(format!"%s failed: Apple server kept answering HTTP %d (temporarily unavailable or rate-limited). Please wait a few minutes and try again."(what, code));
+}
+
 Nullable!AppleLoginError validateStatus(PlistDict status) {
     long errorCode = cast(long) status["ec"].uinteger().native();
     if (!errorCode) {
